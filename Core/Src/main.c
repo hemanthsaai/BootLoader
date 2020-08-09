@@ -57,19 +57,37 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+#define MASK_CRC_BYTES(buf,len_of_buf) ((buf[len_of_buf-1]<<24)| \
+						   (buf[len_of_buf-2]<<16)| \
+						   (buf[len_of_buf-3]<<8)|  \
+						   (buf[len_of_buf-4]))
+
+#define MASK_LEN_BYTES(buf) ((buf[2]<<8)| \
+		   	   	   	   	   	 (buf[1]))
+
 #define FLASH_APPL_START_ADDR 		0x08004000U
 #define FLASH_APPL_PAGES			128   // each page is 128bytes
 
 #define BL_GET_VER 			0xB1
 #define BL_GET_CID 			0xB2
 #define BL_ERASE_FLASH 		0xB3
+#define BL_FLASH_APPL		0xB4
+#define BL_INTEG_CHECK		0xB5
+#define BL_JUMP_APPL		0xB6
+#define	BL_TEST				0xB7
 
-#define BL_GET_VER_LEN 		5
-#define BL_GET_CID_LEN 		5
-#define BL_ERASE_FLASH_LEN  5
+#define BL_GET_VER_LEN 				5
+#define BL_GET_CID_LEN 				5
+#define BL_ERASE_FLASH_LEN 		 	5
+#define BL_TEST_LEN					5
+#define BL_RX_PACK_INFO_LEN			7
 
-#define BL_ERASE_FLASH_SUCCESS	0xC1
-#define BL_ERASE_FLASH_FAILURE	0xC2
+#define BL_ERASE_FLASH_SUCCESS		0xC1
+#define BL_ERASE_FLASH_FAILURE		0xC2
+
+#define BL_RX_BIN_PKT_SIZE			260
+
 
 #define BL_ACK				0xA5
 #define BL_NACK 			0xA6
@@ -80,10 +98,11 @@ void SystemClock_Config(void);
 GPIO_PinState Jump_App = GPIO_PIN_RESET;
 void Bootloader_jump_to_app(void);
 void bootloader_uart_read_data(void);
-uint8_t bootloader_verify_crc(uint8_t * uart_databuf, uint8_t length);
+uint8_t bootloader_verify_crc(uint8_t * uart_databuf, uint32_t length);
 void bootloader_getcid(void);
 void bootloader_getver(uint8_t * uart_databuf);
 void bootloader_erase_appl_flash(uint8_t * uart_databuf);
+void bootloader_flash_appl(uint8_t * uart_databuf);
 HAL_StatusTypeDef status;
 uint8_t uart_databuf[30];
 
@@ -225,9 +244,88 @@ void bootloader_uart_read_data(void)
 		case BL_ERASE_FLASH:
 			bootloader_erase_appl_flash(uart_databuf);
 			break;
+		case BL_FLASH_APPL:
+			bootloader_flash_appl(uart_databuf);
+			break;
+		case BL_JUMP_APPL:
+			Bootloader_jump_to_app();
+			break;
 		default:
 			HAL_UART_Transmit(&huart2,(uint8_t *) "Invalid Command\r\n", 17, HAL_MAX_DELAY);
 		}
+	}
+}
+
+void bootloader_flash_appl(uint8_t * uart_databuf)
+{
+	uint8_t ack = BL_NACK;
+	uint8_t bl_bin_pkt[260] = {0};
+	uint32_t *flash_addr_appl_end=(uint32_t *)FLASH_APPL_START_ADDR;
+	uint32_t opcode = 0;
+	uint16_t app_max_num_pkts = 0;
+	uint16_t app_current_pkt_len = 0;
+	if(  bootloader_verify_crc(uart_databuf, BL_GET_VER_LEN)  )
+	{
+		ack = BL_ACK;
+		HAL_UART_Transmit(&huart2,(uint8_t *) &ack, 1, 300);
+		status = HAL_UART_Receive(&huart2,(uint8_t*) uart_databuf, BL_RX_PACK_INFO_LEN, HAL_MAX_DELAY);
+		if(  bootloader_verify_crc(uart_databuf, BL_RX_PACK_INFO_LEN)  )
+		{
+			ack = BL_ACK;
+			HAL_UART_Transmit(&huart2,(uint8_t *) &ack, 1, 300);
+			app_max_num_pkts = MASK_LEN_BYTES(uart_databuf);
+			HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
+			HAL_FLASH_Unlock();
+			for (uint16_t pkt_num = 0; pkt_num < app_max_num_pkts; pkt_num++)
+			{
+				status = HAL_UART_Receive(&huart2,(uint8_t*) uart_databuf, BL_RX_PACK_INFO_LEN, HAL_MAX_DELAY);
+				if(  bootloader_verify_crc(uart_databuf, BL_RX_PACK_INFO_LEN)  )
+				{
+					ack = BL_ACK;
+					HAL_UART_Transmit(&huart2,(uint8_t *) &ack, 1, 300);
+
+					app_current_pkt_len = MASK_LEN_BYTES(uart_databuf);
+					status = HAL_UART_Receive(&huart2,(uint8_t*) bl_bin_pkt, app_current_pkt_len, HAL_MAX_DELAY);
+					if(  bootloader_verify_crc(bl_bin_pkt, app_current_pkt_len)  )
+					{
+
+						for (int i = 0; i < BL_RX_BIN_PKT_SIZE - 4; i+=4)
+						{
+							opcode = (bl_bin_pkt[i+3] << 24) | (bl_bin_pkt[i+2] << 16) | (bl_bin_pkt[i+1] << 8) | (bl_bin_pkt[i]);
+							*flash_addr_appl_end = opcode;
+							flash_addr_appl_end++;
+						}
+
+						ack = BL_ACK;
+						HAL_UART_Transmit(&huart2,(uint8_t *) &ack, 1, 300);
+					}
+					else
+					{
+						ack = BL_NACK;
+						HAL_UART_Transmit(&huart2,(uint8_t *) &ack, 1, 300);
+					}
+				}
+				else
+				{
+					ack = BL_NACK;
+					HAL_UART_Transmit(&huart2,(uint8_t *) &ack, 1, 300);
+				}
+			}
+			HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
+			HAL_FLASH_Lock();
+		}
+		else
+		{
+			/* Invalid CRC received for LEngth */
+			ack = BL_NACK;
+			HAL_UART_Transmit(&huart2,(uint8_t *) &ack, 1, 300);
+		}
+	}
+	else
+	{
+		/* Invalid CRC received for the command */
+		ack = BL_NACK;
+		HAL_UART_Transmit(&huart2, &ack, 1, HAL_MAX_DELAY);
 	}
 }
 
@@ -295,14 +393,11 @@ void bootloader_getcid(void)
 	}
 }
 
-uint8_t bootloader_verify_crc(uint8_t * uart_databuf, uint8_t length)
+uint8_t bootloader_verify_crc(uint8_t * uart_databuf, uint32_t length)
 {
 	received_crc 	= 0;
-	// MASK the received CRC first
-	for (int i = 3 ; i >= 0 ; i--)
-	{
-		received_crc |= uart_databuf[length-i-1] << 8*i;
-	}
+	// MASK the received CRC. RECEIVED DATA IS ALWAYS MSB FIRST
+	received_crc = MASK_CRC_BYTES(uart_databuf,length);
 	// Calculate CRC from existing Data
 	calculated_crc  = HAL_CRC_Calculate(&hcrc,(uint32_t *) uart_databuf, (uint32_t)length-4);
 	// Validate the received and calculated
